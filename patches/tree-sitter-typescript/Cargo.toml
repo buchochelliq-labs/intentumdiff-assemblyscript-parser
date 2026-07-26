@@ -1,0 +1,19 @@
+[package]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+edition = "2021"
+license = "MIT"
+# Patched: typescript and tsx C sources pre-compiled to separate .a files for wasm32-wasip2.
+# libtree_sitter_typescript.a and libtree_sitter_tsx.a are in lib/.
+build = "build.rs"
+autolib = false
+
+[lib]
+name = "tree_sitter_typescript"
+path = "bindings/rust/lib.rs"
+
+[dependencies.tree-sitter-language]
+version = "0.1"
+
+[build-dependencies]
+cc = "1"
