@@ -298,6 +298,48 @@ mod tests {
     }
 
 
+    /// Operator identity must survive in every arithmetic family, not just
+    /// the original multiplication/exponent test. These are real expressions.
+    #[test]
+    fn arithmetic_operator_replacements_preserve_semantic_identity() {
+        fn find_token<'a>(
+            node: &'a serde_json::Value, token: &str,
+        ) -> Option<&'a serde_json::Value> {
+            if node.get("label").and_then(serde_json::Value::as_str) == Some(token) {
+                return Some(node);
+            }
+            node.get("children")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|children| children.iter().find_map(|child| find_token(child, token)))
+        }
+
+        for (old_expr, new_expr, old_op, new_op) in [
+            ("n + 1", "n - 1", "+", "-"),
+            ("n / 2", "n % 2", "/", "%"),
+            ("n << 1", "n >> 1", "<<", ">>"),
+            ("n & 1", "n | 1", "&", "|"),
+        ] {
+            let old = format!("export function f(n: i32): i32 {{ return {old_expr}; }}");
+            let new = format!("export function f(n: i32): i32 {{ return {new_expr}; }}");
+            let old_tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&old)).expect("valid old parse");
+            let new_tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&new)).expect("valid new parse");
+            assert!(
+                find_token(&old_tree, old_op).is_some(),
+                "old operator {old_op:?} was lost for {old_expr:?}: {old_tree}"
+            );
+            assert!(
+                find_token(&new_tree, new_op).is_some(),
+                "new operator {new_op:?} was lost for {new_expr:?}: {new_tree}"
+            );
+            assert_ne!(
+                old_tree.get("structural_hash"), new_tree.get("structural_hash"),
+                "operator-only edit {old_expr:?} -> {new_expr:?} was masked"
+            );
+        }
+    }
+
     /// Regression for Core #191: anonymous TypeScript operator terminals must survive
     /// semantic conversion; changing arithmetic operators is not formatting.
     #[test]
