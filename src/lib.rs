@@ -137,7 +137,11 @@ fn convert_ts(
                     || is_method_like(n.kind())
                     || matches!(
                         n.kind(),
-                        "number"
+                        // Tree-sitter exposes binary operators as anonymous leaf tokens.
+                        // Without them, n*n -> n**2 leaves an identical return_statement
+                        // scaffold and the semantic engine cannot report the expression edit.
+                        "*" | "**"
+                            | "number"
                             | "string"
                             | "template_string"
                             | "true"
