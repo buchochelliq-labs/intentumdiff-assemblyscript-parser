@@ -137,10 +137,20 @@ fn convert_ts(
                     || is_method_like(n.kind())
                     || matches!(
                         n.kind(),
-                        // Tree-sitter exposes binary operators as anonymous leaf tokens.
-                        // Without them, n*n -> n**2 leaves an identical return_statement
-                        // scaffold and the semantic engine cannot report the expression edit.
-                        "*" | "**"
+                        // Operators are anonymous tree-sitter leaves, but changing
+                        // their spelling changes semantics even when both operands and
+                        // their enclosing AST scaffolds stay identical. Retain the whole
+                        // expression/assignment operator family, not just * and **.
+                        "+" | "-" | "*" | "/" | "%" | "**"
+                            | "<<" | ">>" | ">>>"
+                            | "&" | "|" | "^" | "~"
+                            | "&&" | "||" | "??" | "!"
+                            | "==" | "===" | "!=" | "!=="
+                            | "<" | "<=" | ">" | ">="
+                            | "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**="
+                            | "<<=" | ">>=" | ">>>=" | "&=" | "|=" | "^="
+                            | "&&=" | "||=" | "??=" | "++" | "--"
+                            | "instanceof" | "in" | "as" | "satisfies"
                             | "number"
                             | "string"
                             | "template_string"
