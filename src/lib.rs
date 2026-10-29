@@ -292,4 +292,31 @@ mod tests {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
     }
+
+
+    /// Regression for Core #191: anonymous TypeScript operator terminals must survive
+    /// semantic conversion; changing arithmetic operators is not formatting.
+    #[test]
+    fn binary_operator_tokens_are_preserved_in_source_tree() {
+        fn has_token(node: &serde_json::Value, token: &str) -> bool {
+            node.get("label").and_then(serde_json::Value::as_str) == Some(token)
+                || node.get("children")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|children| children.iter().any(|child| has_token(child, token)))
+        }
+
+        let old = "export function square(n: i32): i32 { return n * n; }\n";
+        let new = "export function square(n: i32): i32 { return n ** 2; }\n";
+        let old_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(old)).expect("old parser tree JSON");
+        let new_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(new)).expect("new parser tree JSON");
+        assert!(has_token(&old_tree, "*"), "old multiply operator is absent: {old_tree}");
+        assert!(has_token(&new_tree, "**"), "new exponent operator is absent: {new_tree}");
+        assert_ne!(
+            old_tree.get("structural_hash"),
+            new_tree.get("structural_hash"),
+            "operator change must not retain the same structural hash"
+        );
+    }
 }
