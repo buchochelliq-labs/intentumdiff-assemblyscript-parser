@@ -137,7 +137,21 @@ fn convert_ts(
                     || is_method_like(n.kind())
                     || matches!(
                         n.kind(),
-                        "number"
+                        // Operators are anonymous tree-sitter leaves, but changing
+                        // their spelling changes semantics even when both operands and
+                        // their enclosing AST scaffolds stay identical. Retain the whole
+                        // expression/assignment operator family, not just * and **.
+                        "+" | "-" | "*" | "/" | "%" | "**"
+                            | "<<" | ">>" | ">>>"
+                            | "&" | "|" | "^" | "~"
+                            | "&&" | "||" | "??" | "!"
+                            | "==" | "===" | "!=" | "!=="
+                            | "<" | "<=" | ">" | ">="
+                            | "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**="
+                            | "<<=" | ">>=" | ">>>=" | "&=" | "|=" | "^="
+                            | "&&=" | "||=" | "??=" | "++" | "--"
+                            | "instanceof" | "in" | "as" | "satisfies"
+                            | "number"
                             | "string"
                             | "template_string"
                             | "true"
@@ -291,5 +305,74 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+
+    /// Operator identity must survive in every arithmetic family, not just
+    /// the original multiplication/exponent test. These are real expressions.
+    #[test]
+    fn arithmetic_operator_replacements_preserve_semantic_identity() {
+        fn find_token<'a>(
+            node: &'a serde_json::Value, token: &str,
+        ) -> Option<&'a serde_json::Value> {
+            if node.get("label").and_then(serde_json::Value::as_str) == Some(token) {
+                return Some(node);
+            }
+            node.get("children")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|children| children.iter().find_map(|child| find_token(child, token)))
+        }
+
+        for (old_expr, new_expr, old_op, new_op) in [
+            ("n + 1", "n - 1", "+", "-"),
+            ("n / 2", "n % 2", "/", "%"),
+            ("n << 1", "n >> 1", "<<", ">>"),
+            ("n & 1", "n | 1", "&", "|"),
+        ] {
+            let old = format!("export function f(n: i32): i32 {{ return {old_expr}; }}");
+            let new = format!("export function f(n: i32): i32 {{ return {new_expr}; }}");
+            let old_tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&old)).expect("valid old parse");
+            let new_tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&new)).expect("valid new parse");
+            assert!(
+                find_token(&old_tree, old_op).is_some(),
+                "old operator {old_op:?} was lost for {old_expr:?}: {old_tree}"
+            );
+            assert!(
+                find_token(&new_tree, new_op).is_some(),
+                "new operator {new_op:?} was lost for {new_expr:?}: {new_tree}"
+            );
+            assert_ne!(
+                old_tree.get("structural_hash"), new_tree.get("structural_hash"),
+                "operator-only edit {old_expr:?} -> {new_expr:?} was masked"
+            );
+        }
+    }
+
+    /// Regression for Core #191: anonymous TypeScript operator terminals must survive
+    /// semantic conversion; changing arithmetic operators is not formatting.
+    #[test]
+    fn binary_operator_tokens_are_preserved_in_source_tree() {
+        fn has_token(node: &serde_json::Value, token: &str) -> bool {
+            node.get("label").and_then(serde_json::Value::as_str) == Some(token)
+                || node.get("children")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|children| children.iter().any(|child| has_token(child, token)))
+        }
+
+        let old = "export function square(n: i32): i32 { return n * n; }\n";
+        let new = "export function square(n: i32): i32 { return n ** 2; }\n";
+        let old_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(old)).expect("old parser tree JSON");
+        let new_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(new)).expect("new parser tree JSON");
+        assert!(has_token(&old_tree, "*"), "old multiply operator is absent: {old_tree}");
+        assert!(has_token(&new_tree, "**"), "new exponent operator is absent: {new_tree}");
+        assert_ne!(
+            old_tree.get("structural_hash"),
+            new_tree.get("structural_hash"),
+            "operator change must not retain the same structural hash"
+        );
     }
 }
