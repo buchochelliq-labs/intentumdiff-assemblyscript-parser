@@ -87,6 +87,62 @@ fn is_text_literal(node: tree_sitter::Node<'_>) -> bool {
     node.is_named() && matches!(node.kind(), "string" | "template_string" | "regex")
 }
 
+/// A template string's source with every `${...}` substitution replaced by its
+/// canonical (comment- and layout-free) form.
+fn canonical_template(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
+    let mut out = String::new();
+    let mut at = node.start_byte();
+    for i in 0..node.named_child_count() {
+        let sub = node.named_child(i).unwrap();
+        if sub.kind() != "template_substitution" {
+            continue;
+        }
+        out.push_str(std::str::from_utf8(&source[at..sub.start_byte()]).unwrap_or(""));
+        out.push_str("${");
+        let mut tokens = Vec::new();
+        for j in 0..sub.named_child_count() {
+            canonical_tokens(sub.named_child(j).unwrap(), source, &mut tokens);
+        }
+        out.push_str(&join_tokens(&tokens));
+        out.push('}');
+        at = sub.end_byte();
+    }
+    out.push_str(std::str::from_utf8(&source[at..node.end_byte()]).unwrap_or(""));
+    out
+}
+
+/// The non-trivia tokens of an expression; text literals stay atomic.
+fn canonical_tokens(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    if TRIVIA.contains(&node.kind()) {
+        return;
+    }
+    if node.kind() == "template_string" {
+        out.push(canonical_template(node, source));
+    } else if is_text_literal(node) || node.child_count() == 0 {
+        let text = node.utf8_text(source).unwrap_or("");
+        if !text.is_empty() {
+            out.push(text.to_string());
+        }
+    } else {
+        for i in 0..node.child_count() {
+            canonical_tokens(node.child(i).unwrap(), source, out);
+        }
+    }
+}
+
+/// Concatenate tokens, separating only where two word characters would fuse.
+fn join_tokens(tokens: &[String]) -> String {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut out = String::new();
+    for t in tokens {
+        if out.chars().last().is_some_and(word) && t.chars().next().is_some_and(word) {
+            out.push(' ');
+        }
+        out.push_str(t);
+    }
+    out
+}
+
 fn label_for_ts(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
     let txt = |n: tree_sitter::Node<'_>| n.utf8_text(source).unwrap_or("").to_string();
     // Text-literal containers label with their COMPLETE source text (#5): their payload
@@ -94,6 +150,11 @@ fn label_for_ts(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
     // regex_pattern), so the generic "(anonymous)" label made `"café"` -> `"cafe雪"`
     // hash identically and certify as style-only. No 120-char cap here: a cap would
     // mask any edit past the prefix of a long string.
+    // Template strings keep their literal fragments verbatim, but each `${...}`
+    // substitution is rendered from its trivia-free token stream (#7).
+    if node.kind() == "template_string" {
+        return canonical_template(node, source);
+    }
     if is_text_literal(node) {
         return txt(node);
     }
@@ -476,5 +537,31 @@ mod tests {
         assert_eq!(h, hash(&parse(base)));
         assert_eq!(h, hash(&parse(&format!("\n{base}\n"))));
         assert_eq!(h, hash(&parse(&format!("// Ordinary comment\n{base}"))));
+    }
+
+    /// Regression for #7: whitespace and comments inside a `${...}` substitution are
+    /// trivia; the literal fragments and the substitution's expression are not.
+    #[test]
+    fn template_substitution_trivia_keeps_label_and_hash() {
+        let wrap = |t: &str| format!("export function m(n: i32, m: i32): string {{ return {t}; }}\n");
+        let tmpl = |src: &str| {
+            let tree = parse(src);
+            let lits = find_kind(&tree, "template_string");
+            assert!(!lits.is_empty(), "{tree}");
+            (label(lits[0]).to_string(), hash(lits[0]).to_string(), hash(&tree).to_string())
+        };
+        let base = tmpl(&wrap("`a${n}b`"));
+        assert_eq!(base.0, "`a${n}b`");
+        for variant in ["`a${ /* comment */ n }b`", "`a${\n  n // note\n}b`", "`a${n }b`"] {
+            assert_eq!(tmpl(&wrap(variant)), base, "{variant:?} is formatting-only");
+        }
+        for changed in ["`c${n}b`", "`a${m}b`", "`a${n + 1}b`", "`a${ n}b `"] {
+            let other = tmpl(&wrap(changed));
+            assert_ne!(other.1, base.1, "{changed:?} must change the literal hash");
+            assert_ne!(other.2, base.2, "{changed:?} masked at root");
+        }
+        // Tokens that need separation keep it; nested templates are canonical too.
+        assert_eq!(tmpl(&wrap("`${typeof  n}`")).0, "`${typeof n}`");
+        assert_eq!(tmpl(&wrap("`x${ `y${ n }` }`")).0.as_str(), "`x${`y${n}`}`");
     }
 }
