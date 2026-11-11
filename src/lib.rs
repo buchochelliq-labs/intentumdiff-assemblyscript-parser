@@ -80,8 +80,23 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
+/// Named literal containers whose value IS their source text but whose payload sits in
+/// child tokens. `string` must be the NAMED literal: the anonymous `string` keyword of a
+/// predefined type annotation is a childless leaf labelled by its text already.
+fn is_text_literal(node: tree_sitter::Node<'_>) -> bool {
+    node.is_named() && matches!(node.kind(), "string" | "template_string" | "regex")
+}
+
 fn label_for_ts(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
     let txt = |n: tree_sitter::Node<'_>| n.utf8_text(source).unwrap_or("").to_string();
+    // Text-literal containers label with their COMPLETE source text (#5): their payload
+    // lives in unnamed/unkept children (`"`, string_fragment, escape_sequence,
+    // regex_pattern), so the generic "(anonymous)" label made `"café"` -> `"cafe雪"`
+    // hash identically and certify as style-only. No 120-char cap here: a cap would
+    // mask any edit past the prefix of a long string.
+    if is_text_literal(node) {
+        return txt(node);
+    }
     // Leaves label with their SOURCE TEXT (#46): with the generic "(anonymous)" label a
     // numeric-literal bump left both sides identical and hashed style-only.
     if node.child_count() == 0 {
@@ -374,5 +389,92 @@ mod tests {
             new_tree.get("structural_hash"),
             "operator change must not retain the same structural hash"
         );
+    }
+
+    fn parse(src: &str) -> serde_json::Value {
+        serde_json::from_str(&process_impl(src)).expect("valid parser tree JSON")
+    }
+
+    fn find_kind<'a>(node: &'a serde_json::Value, kind: &str) -> Vec<&'a serde_json::Value> {
+        let mut out = Vec::new();
+        if node.get("type").or_else(|| node.get("node_type")).and_then(serde_json::Value::as_str)
+            == Some(kind)
+        {
+            out.push(node);
+        }
+        if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+            for child in children {
+                out.extend(find_kind(child, kind));
+            }
+        }
+        out
+    }
+
+    fn label(node: &serde_json::Value) -> &str {
+        node.get("label").and_then(serde_json::Value::as_str).unwrap_or("")
+    }
+
+    fn hash(node: &serde_json::Value) -> &str {
+        node.get("structural_hash").and_then(serde_json::Value::as_str).unwrap_or("")
+    }
+
+    /// Regression for #5 (core case assemblyscript-unicode-payload): the returned string
+    /// payload must survive in the literal's label and in every ancestor hash, with
+    /// 0-based rows and UTF-8 byte columns.
+    #[test]
+    fn returned_unicode_string_payload_changes_semantic_hash() {
+        let old = "export function message(): string { return \"café\"; }\n";
+        let new = "export function message(): string { return \"cafe雪\"; }\n";
+        let old_tree = parse(old);
+        let new_tree = parse(new);
+
+        let old_strings = find_kind(&old_tree, "string");
+        let new_strings = find_kind(&new_tree, "string");
+        let old_lit = old_strings.iter().find(|n| label(n) == "\"café\"")
+            .unwrap_or_else(|| panic!("old payload missing: {old_tree}"));
+        let new_lit = new_strings.iter().find(|n| label(n) == "\"cafe雪\"")
+            .unwrap_or_else(|| panic!("new payload missing: {new_tree}"));
+        assert_eq!(old_lit["position"]["start_line"], 0);
+        assert_eq!(old_lit["position"]["start_col"], 43);
+        assert_eq!(old_lit["position"]["end_col"], 50, "UTF-8 byte column for café");
+        assert_eq!(new_lit["position"]["end_col"], 52, "UTF-8 byte column for cafe雪");
+        assert_ne!(hash(old_lit), hash(new_lit));
+        assert_ne!(hash(&old_tree), hash(&new_tree), "string payload edit masked at root");
+
+        // The `string` return-type keyword is not a literal and keeps its keyword label.
+        assert!(old_strings.iter().any(|n| label(n) == "string"));
+    }
+
+    /// The literal label is the COMPLETE payload: an edit past any display prefix of a
+    /// long string must still change the hash.
+    #[test]
+    fn long_string_tail_edit_changes_semantic_hash() {
+        let body = "x".repeat(300);
+        let old = format!("export function m(): string {{ return \"{body}a\"; }}\n");
+        let new = format!("export function m(): string {{ return \"{body}b\"; }}\n");
+        assert_ne!(hash(&parse(&old)), hash(&parse(&new)));
+    }
+
+    /// Template-string and regex payloads are text literals too.
+    #[test]
+    fn template_and_regex_payload_edits_change_semantic_hash() {
+        for (old, new) in [
+            ("export function m(n: i32): string { return `a${n}b`; }\n",
+             "export function m(n: i32): string { return `a${n}c`; }\n"),
+            ("const r = /ab+/g;\n", "const r = /ab*/g;\n"),
+        ] {
+            assert_ne!(hash(&parse(old)), hash(&parse(new)), "{old:?} -> {new:?} masked");
+        }
+    }
+
+    /// Controls: identity, layout and an ordinary comment keep the tree hash.
+    #[test]
+    fn string_identity_layout_and_comment_keep_hash() {
+        let base = "export function message(): string { return \"café\"; }\n";
+        let h = hash(&parse(base)).to_string();
+        assert!(!h.is_empty());
+        assert_eq!(h, hash(&parse(base)));
+        assert_eq!(h, hash(&parse(&format!("\n{base}\n"))));
+        assert_eq!(h, hash(&parse(&format!("// Ordinary comment\n{base}"))));
     }
 }
